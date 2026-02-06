@@ -16,7 +16,7 @@ In entity resolution,merging two different companies is usually worse than faili
 
 ---
 
-## 2. Understanding the task: What counts as “the same company”?
+## 2. Understanding the task: What counts as the same company?
 
 A real-world company is an organization that might appear across systems with:
 
