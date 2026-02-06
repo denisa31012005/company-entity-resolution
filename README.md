@@ -1,305 +1,379 @@
-# Company Entity Resolution (Dedup) — Safer Version (Anti Over-Merge)
+# Company Entity Resolution Project
 
-This project performs **company entity resolution / deduplication** at scale using **PySpark**, producing:
-1) a stable `record_id` per row  
-2) an `entity_id` that groups records believed to represent the same real-world company  
-3) an evidence/audit table describing *why* records were linked
+## 1.What this project is about
 
-It is intentionally tuned to be **conservative** (reduce “over-merging”), using **blocking + deterministic matches + guarded fuzzy matching**, plus **cluster sanity checks**.
+The dataset contains **company records imported from multiple systems**, so the same real-world company can show up many times with small differences (typos, missing fields, different formatting,different naming conventions).
 
----
+My goal was to **identify unique companies** and **group duplicate records** together.  
+To do that, I produced:
 
-## Results (quality + quick validation)
+- a **stable `record_id`** (one per row, so every record is uniquely trackable)
+- an **`entity_id`** (one per real company,used to group duplicates)
+- an **evidence table** explaining **why** two records were linked 
 
-> Fill the placeholders below with numbers from your run; this section is what reviewers look for first.
-
-- **Input records:** `<N_records>`
-- **Unique entities produced:** `<N_entities>`
-- **Dedup reduction:** `<(1 - N_entities/N_records) * 100>%`
-- **Largest cluster size:** `<max_cluster_size>`
-- **Sanity flags:** `<N_suspicious_clusters>` clusters flagged by over-merge detectors
-
-**Precision proxy (lightweight checks):**
-- Manually inspected the **top `<K>` largest clusters** and a random sample of `<M>` clusters:
-  - **Obvious false merges:** `<count>` / `<sample_size>`
-  - **Obvious false splits (missed merges):** `<count>` / `<sample_size>`
-- Reviewed the **evidence table** for flagged clusters to confirm which keys/edges caused links.
-
-**Before/after examples (anonymize if needed):**
-- Entity `<entity_id_1>`:  
-  - Before: `["ACME LLC", "Acme, L.L.C.", "ACME"]`  
-  - Shared evidence: `domain`, `phone`, `postcode` (name_score ~ `<score>`)
-- Entity `<entity_id_2>`:  
-  - Before: `["Foo GmbH", "FOO GMBH Berlin"]`  
-  - Shared evidence: `email`, `city+country` (name_score ~ `<score>`)
+A very important design choice:I intentionally built the pipeline to be safer against accidental over-merging.
+In entity resolution,merging two different companies is usually worse than failing to merge duplicates, because over-merges create incorrect entities that are hard to fix later.
 
 ---
 
-## What defines a “company” here (and why these attributes)
+## 2. Understanding the task: What counts as “the same company”?
 
-A real-world company is an organization that can appear multiple times across systems with inconsistent formatting, missing fields, and different naming conventions. In practice, **no single field is always a perfect identifier**, so this system combines:
+A real-world company is an organization that might appear across systems with:
 
-**Strong identifiers (high precision, can still be shared):**
-- **Website domain**: often unique for an organization, but can be shared across corporate groups, franchises, resellers, or web-hosting patterns.
-- **Email address / email domain**: direct email addresses are strong, but shared inboxes (info@), or vendor-managed domains can cause collisions.
-- **Phone number**: strong in many datasets, but call-centers, HQ numbers, or BPO providers can be reused.
+- different formats (ex: “LLC” vs “L.L.C.”)
+- different languages (ex:GmbH, SRL,SA)
+- incomplete records (missing phone or missing domain)
+- shared information 
 
-**Weak identifier (needs corroboration):**
-- **Company name**: highly variable (suffixes, punctuation, transliterations) and often **non-unique** (“Acme”, “Global Trading”).  
-  → Therefore, name similarity is used only with corroborating signals (geo/postcode/email domain + country).
+So there is no single perfect key that always identifies a company.  
+This is why entity resolution needs a mix of signals:
 
-**Contextual attributes (used to reduce false merges):**
-- **Country, city, postcode, coarse lat/lon**: not unique alone, but helpful to confirm “same org” when names are similar.
+### Strong identifiers (have high precision, but still not always perfect)
+- **Website domain**: often unique, but can be shared across groups, franchises
+- **Email address**: strong, but can be shared (`info@`, `contact@`).
+- **Phone number**: strong, but can be reused by call centers
 
-This design matches the task goal: **leverage the most relevant attributes**, and justify decisions with explicit reasoning.
+### Weak identifier
+- **Company name**: can be messy and not unique so I thought that name alone is risky.
 
----
-
-## What the code does (high level)
-
-### Pipeline stages
-1. **Load input (Parquet)**
-2. **Data profiling (completeness report)**
-3. **Normalization / standardization** of key attributes (domain, names, phones, emails, geo)
-4. **Blocking key generation** (multiple strategies)
-5. **Pair generation (candidates)** via blocking (excluding huge blocks)
-6. **Matching**
-   - Deterministic “hard” edges (domain/phone/email with caps and constraints)
-   - Fuzzy “soft” edges (RapidFuzz name similarity + corroboration rules)
-7. **Graph clustering** via **connected components**
-   - Implemented with a **label-propagation / min-label** iterative algorithm  
-   - **GraphFrames is optional but disabled by default** to keep deployment simpler and avoid extra runtime dependencies (and because the min-label approach is portable and works well for this scale).
-8. **Sanity checks & over-merge detectors**
-9. **Write outputs**: mapping, updated dataset, evidence table
+### Context attributes (I used for confirmation)
+- **Country, city, postcode, rounded geo-coordinates**: not unique alone, but very useful to confirm identity when name matches.
 
 ---
 
-## Key concepts used
+## 3. Why I used Spark (PySpark)
 
-### 1) Distributed processing with Spark
-- Uses **SparkSession** and Spark SQL/DataFrame transformations.
-- Relies on **lazy evaluation**, then triggers execution with actions like `count()`, `show()`, writes.
-- Performance tools:
-  - `.cache()` / `.persist(StorageLevel.MEMORY_AND_DISK)` for reuse
-  - `.repartition(200)` to control parallelism
-  - `checkpoint()` to cut lineage (avoid huge DAGs and recomputation)
+Even though the provided dataset might not be “billions of records”, entity resolution is naturally expensive because the naive approach is:
 
----
+> compare every record with every other record (O(n²))
 
-### 2) Data quality profiling (completeness report)
-- Computes per-column **% non-null**:
-  - `count(when(col(c).isNotNull(), 1)) * 100 / n`
-- Uses `stack()` to reshape wide completeness results into a “pretty” long format table.
+That becomes impossible quickly.
 
----
+I used **PySpark** because it is designed for **large-scale distributed processing**, and it lets the same logic scale up much more easily:
 
-### 3) Feature normalization (standardization)
-Normalization is used to reduce noise before matching.
-
-**Website/domain**
-- Lowercase + trim
-- Extracts domain from URL with regex (remove protocol, `www`, path/query)
-- Chooses best source (`website_domain` preferred; fallback to derived)
-- Validates with a domain regex; invalid domains -> `null`
-
-**Company names**
-- Lowercase, remove punctuation, collapse whitespace
-- Removes common **legal suffixes** (Inc, LLC, GmbH, SRL, etc.)
-- Produces normalized variants:
-  - `company_name_norm`
-  - `company_commercial_names_norm`
-  - `company_legal_names_norm`
-
-**Phones**
-- Strips non-digits (keeps `+`)
-- Splits multi-phone strings into arrays (supports separators like `| , ;`)
-- Builds normalized phone arrays and a “best available” phone (`phone_any_norm`)
-
-**Emails**
-- Lowercase + regex validate
-- Extracts email domain (`email_domain`)
-
-**Geography / address**
-- Normalizes country code, city, postcode, street fields
-- Casts lat/lon to double and rounds to 3 decimals for coarse geo matching
+- DataFrames + Spark SQL operations are optimized for big data
+- Spark’s **lazy evaluation** helps build an efficient execution plan
+- Caching/persisting avoids recomputing heavy transformations
+- Repartitioning helps control parallelism
+- Checkpointing helps avoid extremely long Spark DAG lineages
 
 ---
 
-### 4) Blocking (candidate reduction)
-Instead of comparing every record to every other record (quadratic explosion), the code builds **blocking keys** to generate likely candidate pairs.
+## 4. The main idea of my approach
 
-Blocking keys include:
-- Domain-based: `dom:<domain>`
-- Phone-based: `ph:<phone>` (one per phone + a representative phone)
-- Email-based: `em:<email>`
-- Email-domain + name head: `emd:<email_domain>|<first_token_of_name>`
-- Geo-based:
-  - `geo1:<country>|<city>`
-  - `geo2:<country>|<postcode>`
-  - `geo3:<lat_r3>|<lon_r3>`
-- Name-based:
-  - first 1–2 tokens “fingerprint” (`name_fp`)
-  - `nm1:<country>|<name_fp>`
-  - `nm2:<country>|<name_fp>|<postcode>`
+I treated entity resolution like building a **graph**:
 
-It also:
-- removes null keys (`filter`)
-- deduplicates keys (`array_distinct`)
-- inspects block sizes to understand risk (large blocks are dangerous)
+- each record = a **node**
+- if two records match (based on strong rules or fuzzy rules)=an **edge**
+- each final company entity= a **connected component** in that graph
 
-**Note on performance:** the fuzzy name UDF is comparatively expensive, so **blocking is doing the heavy lifting** by limiting UDF evaluation to a small candidate set rather than the full Cartesian product.
+This is a common and practical way to solve deduplication, because:
+- real duplicates may not match directly,  but can connect through shared evidence
+- it gives  a clean final grouping (`entity_id`) after edges are created
+
+But connected components has one big risk: **chaining over-merges**  
+(A matches B, B matches C → then A and C become the same entity).
+
+That’s why I invested a lot of effort in safe edges and anti over-merge safeguards.
 
 ---
 
-## 5) Anti over-merge safeguards (core idea)
+## 5. Pipeline overview 
 
-The code is designed to avoid “giant accidental clusters” by applying multiple guardrails:
+### Step 1: Load the data and create a stable identifier
+- Input: `veridion.parquet`
+- I create `record_id` using `monotonically_increasing_id()`
 
-**A) Key size caps for deterministic links**
-- Do not link on a key if it appears too often:
-  - `MAX_DOMAIN_KEY_SIZE`
-  - `MAX_PHONE_KEY_SIZE`
-  - `MAX_EMAIL_KEY_SIZE`
-This prevents shared call-centers, shared domains, or common emails from merging huge populations.
-
-**B) Country constraints for deterministic links**
-- Domain edges: require **same domain AND same country**
-- Phone edges: require **same phone AND same country**
-- Email edges: require **same email AND same country**
-This reduces cross-country false merges for multinationals or shared contact points.
-
-**C) Block size cap for candidate generation**
-- `MAX_BLOCK_SIZE` removes huge blocks before pair-building.
-This prevents generating billions of candidate pairs and also reduces low-quality “everyone with same weak key” comparisons.
+Why I used this approach:
+- I need a stable row identifier for joins,edges,and tracking
+- it avoids using expensive window functions for unique IDs
 
 ---
 
-## 6) Matching strategy (edges in a graph)
+### Step 2: Completeness report
+I computed the percentage of non-null values per column.
 
-### 6.1 Deterministic edges (exact matches)
-Creates “hard” links (edges) between record pairs:
-- `det_domain_cc` (domain + country)
-- `det_phone_cc`  (phone + country)
-- `det_email_cc`  (email + country)
+Why I did this:
+- In entity resolution, you need to know **what fields are actually usable**
+- if email is mostly missing, it won’t help much
+- if domain is frequently present, it becomes a strong signal
 
-Each edge includes:
+This step also helps explain *why* I prioritized some attributes.
+
+---
+
+### Step 3 :Normalization
+Normalization is a core entity resolution concept:  
+**make the same thing look the same before matching.**
+
+I normalized these fields:
+
+#### 3.1 Domain /website
+- lowercasing and trimming
+- extracting domain from URL (remove protocol, `www`, paths)
+- validating domain format(invalid → null)
+- choosing best domain source (`website_domain` preferred, fallback to extracted)
+
+Why:
+- one system may store `https://www.acme.com/path`, another stores `acme.com`
+- matching only works if these become the same normalized value
+
+#### 3.2 Company names
+- lowercase
+- remove punctuation
+- collapse whitespace
+- remove legal suffixes(Inc, LLC, GmbH, SRL, SA, etc.)
+
+Why:
+- “Gisinger GmbH” and “Gisinger” should be treated as the same name core
+- suffixes are usually not meaningful for identity matching across systems
+
+#### 3.3 Phones
+- remove non-digit characters(keeping `+`)
+- split multi-phone columns into arrays
+- keep a representative phone (`phone_any_norm`) for faster matching
+
+Why:
+- phone formats differ a lot:`+1 (234) 567-890` vs `1234567890`
+
+#### 3.4 Emails
+- lowercase
+- regex validate format
+- extract email domain
+
+Why:
+- email domain is useful as a *supporting* signal
+
+#### 3.5 Geography /address
+- normalize country code,city, postcode
+- cast lat/lon to numeric and round to 3 decimals (`lat_r3`, `lon_r3`)
+
+Why:
+- geographic confirmation is extremely useful to prevent false merges
+- rounding geo makes it usable even when coordinates differ slightly
+
+---
+
+## 6. Blocking (candidate reduction)
+
+Blocking is one of the most important techniques in entity resolution.
+
+### Why blocking is needed in my project
+Without blocking, comparing all pairs is quadratic and impossible for large datasets.
+
+So instead, I created **blocking keys**:  
+records only get compared if they share a block key.
+
+### Blocking keys I used(and why)
+I used multiple blocking strategies to increase recall while keeping efficiency:
+
+- `dom:<domain>` — strong,high precision
+- `ph:<phone>` — strong,but can be shared
+- `em:<email>` — strong,but also capped later
+- `emd:<email_domain>|<name_head>` —helps catch cases where exact email differs but same org domain exists
+- `geo1:<country>|<city>` —location-based grouping
+- `geo2:<country>|<postcode>` —tighter location grouping
+- `geo3:<lat_r3>|<lon_r3>` — geo coordinate grouping
+- `nm1:<country>|<name_fp>` —name fingerprint + country
+- `nm2:<country>|<name_fp>|<postcode>` — even safer name grouping
+
+Why multiple blocks:
+- using multiple blocks avoids losing duplicates just because one field is missing
+
+### Huge block filtering
+I calculated block sizes and removed overly large blocks (`MAX_BLOCK_SIZE`).
+
+Why:
+- huge blocks create too many pairs
+- huge blocks are usually low-quality (e.g:a very common city name or generic company name)
+- filtering huge blocks improves performance and also reduces accidental merges
+
+---
+
+## 7. How I decide that  two records should link
+
+I used a hybrid approach:
+
+### 7.1 Deterministic matching (exact edges)
+I created edges for exact matches of:
+- domain +same country (`det_domain_cc`)
+- phone +same country (`det_phone_cc`)
+- email+ same country (`det_email_cc`)
+
+Why same country:
+- without country constraint, a shared domain or shared contact could merge across countries incorrectly
+
+### Key-size caps (used for anti over-merge )
+Even “strong identifiers” can be shared.  
+So I added caps:
+
+- `MAX_DOMAIN_KEY_SIZE`
+- `MAX_PHONE_KEY_SIZE`
+- `MAX_EMAIL_KEY_SIZE`
+
+Why I added caps:
+> if a domain/phone/email appears too many times,it is treated as unreliable and is not used for linking.
+
+Why:
+- common support numbers or shared domains can cause massive over-merges
+
+---
+
+### 7.2 Fuzzy matching
+Fuzzy matching is mainly for names,because names vary.
+
+I used **RapidFuzz** `token_set_ratio` to compute `name_score`.
+
+Why token_set_ratio:
+- it handles token order differences well
+- it’s robust against small differences while being simple
+
+#### The safe fuzzy rule I used
+A fuzzy match only becomes an edge if:
+- `name_score >= 90`
+- and also at least one strong corroboration is true:
+  - same postcode, or
+  - same country + same city, or
+  - same rounded geo coordinates, or
+  - same email domain **and** same country 
+
+Why I thought that this is important:
+- name-only matching is dangerous
+- requiring a second signal prevents merges based purely on similarity
+- email domain is treated as weaker evidence and must be paired with geography/country
+
+So fuzzy matching improves recall, but the rule design keeps precision high.
+
+---
+
+## 8. Clustering into final entities(connected components)
+
+After creating match edges, the “duplicate grouping” becomes:
+> find connected components in the graph
+
+Implementation detail:
+- I used a label-propagation iterative algorithm (doesn’t require GraphFrames)
+
+Why I did it this way:
+- GraphFrames adds extra dependency complexity
+- the min-label approach is simple and works at scale in Spark
+- it’s also easier to control and debug
+
+Final result:
+- every record gets an `entity_id` representing its connected component
+
+---
+
+## 9. Over-merge detection
+
+Because connected components can chain merges, I added checks after clustering:
+
+### Cluster size distribution
+- largest clusters are inspected first
+- very large clusters can indicate shared keys caused too much linking
+
+### Name diversity ratio inside clusters
+I computed:
+
+- number of records in cluster (`n`)
+- number of distinct name fingerprints (`distinct_name_fp`)
+- `name_div_ratio = distinct_name_fp / n`
+
+Then I flagged suspicious clusters:
+- big clusters (`n >= 20`)
+- high name diversity (`> 0.4`)
+
+Why:
+- a real company cluster usually has *similar* names
+- a cluster with many different name fingerprints is likely an over-merge
+
+This isn’t a perfect metric, but it’s a practical warning system.
+
+---
+
+## 10. Evidence table
+
+I produced an evidence dataset that stores, for each edge:
+
+- `entity_id`
+- `src`, `dst`
 - `match_type`
-- `score` (100 for deterministic)
-- human-readable `reason` for auditing
+- `score`
+- `reason`
 
-### 6.2 Fuzzy edges (name similarity + corroboration)
-- Uses **RapidFuzz** `token_set_ratio` via a Spark **UDF** to compute `name_score`.
-- A pair becomes a match only if:
-  - `name_score >= 90`
-  - AND at least one strong corroborator holds:
-    - same postcode, OR
-    - same country + same city, OR
-    - same rounded geocoordinates, OR
-    - same email domain **AND** same country (explicitly *not allowed alone*)
-
-This “AND corroboration” rule is the main safety mechanism preventing name-only merges (e.g., “Acme” in many places).
+Why I did this:
+- in real entity resolution systems,explainability is critical
 
 ---
 
-## 7) Graph-based clustering (connected components)
+## 11. Outputs (deliverables)
 
-After producing edges, the dedup task becomes:
-> “Find clusters of records connected by match edges.”
+### Required output: updated dataset
+- `veridion_with_entity_id_parquet`
+  - original dataset + `record_id` + `entity_id`
 
-Implementation details:
-- Builds an undirected graph by unioning edges with reversed direction.
-- Uses an iterative **label propagation / union-find-like** approach:
-  - initialize label = own id
-  - each iteration: propagate labels over edges
-  - take the minimum label per vertex
-  - repeat up to `MAX_ITERS`
+Why I used `df_raw` for the final dataset:
+- I didn’t want to leak engineered columns (normalized features, block keys)
+- deliverable should contain clean original fields +entity assignment
 
-**Why connected components is acceptable (and the downside):**
-- **Pro:** It is simple, scalable, and maps naturally to “linked by evidence edges.”
-- **Con:** Connected components can **over-merge through chaining** (A matches B, B matches C → A and C end up in the same entity even if they wouldn’t match directly).
-- **Mitigation in this project:** edge creation is intentionally conservative (caps + country constraints + corroborated fuzzy rules) and clusters are post-validated (size + name diversity checks) to surface suspicious merges.
-
-Result:
-- `entity_id` is the final cluster label (string)
+### Additional outputs
+- `entity_map_parquet`
+  - just `record_id`, `entity_id` (useful for joins)
+- `entity_edges_evidence_parquet`
+  - evidence table for explainability and validation
 
 ---
 
-## 8) Cluster sanity checks (over-merge detection)
+## 12. What I would improve next
 
-After clustering:
-- Checks if any records missed an `entity_id` and assigns fallback `entity_id = record_id`.
+Entity resolution always involves tradeoffs. 
+If I extended this:
 
-Diagnostics:
-- **Cluster size distribution** (largest clusters first)
-- **Name diversity ratio** within cluster:
-  - `distinct_name_fp / n`
-- Flags suspicious clusters:
-  - big clusters (n ≥ 20) with high name diversity (> 0.4)
-
-Also prints sample rows from top clusters to manually inspect.
+- better handling of corporate groups using additional org hierarchy signals
+- smarter phone logic (e.g., recognize call-center patterns)
+- cluster repair strategies (split suspicious clusters based on weak edges)
 
 ---
 
-## 9) Auditability (evidence table)
+## 13. Summary of key concepts used
 
-Builds an evidence dataset linking:
-- `entity_id`, `src`, `dst`
-- `match_type`, `score`, `reason`
-
-Keeps only edges that are internal to a final cluster (both endpoints share same entity).  
-This supports explainability, debugging, and manual review of flagged clusters.
-
----
-
-## Known failure modes & mitigations
-
-No dedup system is perfect; these are the primary risks and how this project handles them:
-
-- **Corporate groups / shared domains** (parent + subsidiaries on same domain)  
-  - *Risk:* merging separate legal entities into one entity.  
-  - *Mitigation:* key size caps + country constraints + corroboration for fuzzy edges; flagged by diversity checks.
-
-- **Franchises / resellers** (shared brand name, similar websites)  
-  - *Risk:* name-based merges across locations.  
-  - *Mitigation:* name-only merges are disallowed; geo corroboration required.
-
-- **Shared phone numbers** (call centers, HQ, outsourced support)  
-  - *Risk:* large accidental clusters.  
-  - *Mitigation:* key caps + country constraint; large blocks filtered.
-
-- **Multilingual / transliterated names**  
-  - *Risk:* missed merges (false splits).  
-  - *Mitigation:* token-set similarity helps some; can be extended with additional name normalization/aliases.
-
-- **Sparse records** (missing domain/phone/email/geo)  
-  - *Risk:* low recall.  
-  - *Mitigation:* multiple blocking strategies; still expected to miss some merges when data is too incomplete.
+- **Spark / istributed processing** → needed for scalable ER and big pair operations
+- **Normalization** →reduces formatting noise and increases match reliability
+- **Blocking** →makes ER possible by avoiding O(n²) comparisons
+- **Deterministic matching**→ high-precision edges for strong identifiers
+- **Key-size caps**→ prevents shared identifiers from creating false clusters
+- **Country constraints** →reduces cross-country false merges
+- **Fuzzy name similarity** → handles name variation,but guarded for safety
+- **Corroboration rules** →stops name-only merges, improves precision
+- **Graph clustering** → natural way to group linked duplicates
+- **Sanity checks** → detects likely over-merges
+- **Evidence table** → explainability
 
 ---
 
-## Inputs / Outputs
+## 14. How to run
 
-### Input
-- `veridion.parquet` (company records)
-
-### Outputs (Parquet)
-1. `entity_map_parquet`
-   - columns: `record_id`, `entity_id`
-2. `veridion_with_entity_id_parquet`
-   - original raw columns + `record_id` + `entity_id`
-   - uses `df_raw` to avoid leaking engineered feature columns
-3. `entity_edges_evidence_parquet`
-   - columns: `entity_id`, `src`, `dst`, `match_type`, `score`, `reason`
+1. Put `veridion.parquet` in the working directory
+2. Run the PySpark script
+3. Collect outputs:
+   - `entity_map_parquet`
+   - `veridion_with_entity_id_parquet`
+   - `entity_edges_evidence_parquet`
 
 ---
 
-## Repro / how to run
+## 15. Results section
 
-> Adjust paths, Spark settings, and main entrypoint names to your repo.
+- **Input records:** 33,446
+- **Unique entities produced:** 7,941
+- **Dedup reduction:** 1-(7941/33,446)-> ~76.3%
+- **Largest cluster size:** 107
+- **Suspicious clusters flagged:** 23
 
-### Local (example)
-```bash
-pip install -r requirements.txt
-python -m entity_resolution.run \
-  --input parquet:///path/to/veridion.parquet \
-  --out_dir parquet:///path/to/output_dir
+Manual checks performed:
+- inspected top **5** largest clusters
+- inspected a sample of **10** clusters
+- checked the **evidence table** for flagged clusters
+
+The results show a significant reduction in duplicate records, with roughly three quarters of the dataset being grouped into entities.
+
